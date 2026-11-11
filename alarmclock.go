@@ -2,6 +2,7 @@ package alarmclock
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,12 +15,13 @@ type AlarmClock struct {
 }
 
 type alarmGroup struct {
-	channels [alarmChannelCount]chan struct{}
-	next     int
+	channels   [alarmChannelCount]chan struct{}
+	next       int
+	spinWindow atomic.Int64
 }
 
-// New creates an alarm clock with a one-minute spin window.
-// New는 바쁜대기 구간이 1분인 알람 시계를 생성합니다.
+// New creates an alarm clock with a maximum spin window of one minute.
+// New는 바쁜대기 구간의 상한이 1분인 알람 시계를 생성합니다.
 func New() *AlarmClock {
 	return &AlarmClock{spinWindow: time.Minute}
 }
@@ -40,11 +42,37 @@ func (clock *AlarmClock) SetAlarm(at time.Time) <-chan struct{} {
 
 	group := clock.alarms[key]
 	if group == nil {
+		window := clock.spinWindow
+		var successor *alarmGroup
+		var successorAt time.Time
+
+		// Cap the new window by the predecessor gap and find the successor.
+		// 직전 알람과의 간격으로 새 대기 구간을 제한하고 다음 알람을 찾습니다.
+		for otherAt, other := range clock.alarms {
+			if otherAt.Before(key) {
+				window = min(window, key.Sub(otherAt))
+			} else if successor == nil || otherAt.Before(successorAt) {
+				successor, successorAt = other, otherAt
+			}
+		}
+
 		group = &alarmGroup{}
+		group.spinWindow.Store(int64(window))
 		for i := range group.channels {
 			group.channels[i] = make(chan struct{})
 		}
 		clock.alarms[key] = group
+
+		// Inserting an alarm can only shorten the successor's spin window.
+		// 알람을 삽입하면 다음 알람의 바쁜대기 구간은 짧아지기만 합니다.
+		if successor != nil {
+			window := min(
+				time.Duration(successor.spinWindow.Load()),
+				successorAt.Sub(key),
+			)
+			successor.spinWindow.Store(int64(window))
+		}
+
 		go clock.runAlarm(at, key, group)
 	}
 
@@ -57,14 +85,20 @@ func (clock *AlarmClock) runAlarm(at, key time.Time, group *alarmGroup) {
 	var closed sync.WaitGroup
 	closed.Add(len(group.channels))
 
-	// Each goroutine waits independently and closes its own channel.
-	// 각 고루틴이 독립적으로 기다린 뒤 자기 채널을 닫습니다.
 	for _, ch := range group.channels {
 		go func() {
-			if remaining := time.Until(at); remaining > clock.spinWindow {
-				time.Sleep(remaining - clock.spinWindow)
-			}
-			for time.Until(at) > 0 {
+			for {
+				remaining := time.Until(at)
+				if remaining <= 0 {
+					break
+				}
+
+				// Recheck after sleeping and while spinning to observe a shorter window.
+				// 잠에서 깬 뒤와 바쁜대기 중에 다시 확인해 줄어든 구간을 반영합니다.
+				window := time.Duration(group.spinWindow.Load())
+				if remaining > window {
+					time.Sleep(remaining - window)
+				}
 			}
 
 			close(ch)
