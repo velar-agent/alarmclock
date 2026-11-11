@@ -1,40 +1,80 @@
 package alarmclock
 
-import "time"
+import (
+	"sync"
+	"time"
+)
+
+const alarmChannelCount = 4
 
 type AlarmClock struct {
-	// 목표 시각 전에 바쁜대기를 수행할 시간입니다.
 	spinWindow time.Duration
+	mu         sync.Mutex
+	alarms     map[time.Time]*alarmGroup
 }
 
+type alarmGroup struct {
+	channels [alarmChannelCount]chan struct{}
+	next     int
+}
+
+// New creates an alarm clock with a one-minute spin window.
 // New는 바쁜대기 구간이 1분인 알람 시계를 생성합니다.
-// 알람1분전에 CPU가 깨어남
 func New() *AlarmClock {
-	return &AlarmClock{
-		spinWindow: time.Minute,
-	}
+	return &AlarmClock{spinWindow: time.Minute}
 }
 
-// SetAlarm은 목표 시각까지 기다린 뒤 action을 실행하고 완료 채널을 닫습니다.
-func (clock *AlarmClock) SetAlarm(at time.Time, action func()) <-chan struct{} {
-	done := make(chan struct{})
+// SetAlarm returns a shared channel that closes at or after the target time.
+// SetAlarm은 목표 시각 이후 닫히는 공유 채널 하나를 반환합니다.
+func (clock *AlarmClock) SetAlarm(at time.Time) <-chan struct{} {
+	// Normalize only the map key; preserve the original clock basis for waiting.
+	// 맵 키만 정규화하고 실제 대기에는 원래 시계 기준을 유지합니다.
+	key := at.Round(0).UTC()
 
-	go func() {
-		// 바쁜대기 구간이 시작될 때까지 잠들어 CPU 사용을 줄입니다.
-		if remaining := time.Until(at); remaining > clock.spinWindow {
-			time.Sleep(remaining - clock.spinWindow)
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+
+	if clock.alarms == nil {
+		clock.alarms = make(map[time.Time]*alarmGroup)
+	}
+
+	group := clock.alarms[key]
+	if group == nil {
+		group = &alarmGroup{}
+		for i := range group.channels {
+			group.channels[i] = make(chan struct{})
 		}
+		clock.alarms[key] = group
+		go clock.runAlarm(at, key, group)
+	}
 
-		// 바쁜대기 구간에서는 목표 시각에 도달할 때까지 시간을 계속 확인합니다.
-		for time.Until(at) > 0 {
-		}
+	ch := group.channels[group.next]
+	group.next = (group.next + 1) % len(group.channels)
+	return ch
+}
 
-		// 기다리던 고루틴에서 작업을 바로 실행합니다.
-		action()
+func (clock *AlarmClock) runAlarm(at, key time.Time, group *alarmGroup) {
+	var closed sync.WaitGroup
+	closed.Add(len(group.channels))
 
-		// 작업이 끝난 뒤 완료를 알립니다.
-		close(done)
-	}()
+	// Each goroutine waits independently and closes its own channel.
+	// 각 고루틴이 독립적으로 기다린 뒤 자기 채널을 닫습니다.
+	for _, ch := range group.channels {
+		go func() {
+			if remaining := time.Until(at); remaining > clock.spinWindow {
+				time.Sleep(remaining - clock.spinWindow)
+			}
+			for time.Until(at) > 0 {
+			}
 
-	return done
+			close(ch)
+			closed.Done()
+		}()
+	}
+
+	closed.Wait()
+
+	clock.mu.Lock()
+	delete(clock.alarms, key)
+	clock.mu.Unlock()
 }

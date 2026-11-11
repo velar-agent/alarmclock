@@ -27,10 +27,15 @@ func main() {
 		close(afterDone)
 	}()
 
-	busyDone := alarmclock.New().SetAlarm(alarmAt, func() {
-		// 콜백에 진입한 직후 시각을 기록합니다.
+	busyAlarm := alarmclock.New().SetAlarm(alarmAt)
+	busyDone := make(chan struct{})
+	go func() {
+		<-busyAlarm
+		// Record the actual receive time and then signal recording completion.
+		// 실제 수신 시각을 기록한 뒤 기록 완료를 알립니다.
 		busyFiredAt = time.Now().Round(0)
-	})
+		close(busyDone)
+	}()
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
